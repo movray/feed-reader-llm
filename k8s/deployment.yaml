@@ -1,0 +1,240 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: news-feed
+  namespace: feedreader
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: news-feed
+  template:
+    metadata:
+      labels:
+        app: news-feed
+    spec:
+      volumes:
+      - name: html
+        emptyDir: {}
+      - name: scripts
+        configMap:
+          name: news-feed-script
+      - name: nginx-config
+        configMap:
+          name: nginx-config
+
+      initContainers:
+      - name: init-db
+        image: postgres:16-alpine
+        env:
+        - name: PGHOST
+          value: "feedreader-db-cluster-rw"
+        - name: PGDATABASE
+          value: "feedconfig"
+        - name: PGPORT
+          value: "5432"
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: feeduser-credentials
+              key: username
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: feeduser-credentials
+              key: password
+        - name: LLM_BASE_URL
+          value: "http://localhost:11434/v1"
+        command:
+        - sh
+        - -c
+        - |
+          until psql -c '\q' 2>/dev/null; do
+            echo "Waiting for database..."
+            sleep 2
+          done
+          psql -v llm_url="$LLM_BASE_URL" <<'SQL'
+          CREATE TABLE IF NOT EXISTS sources (
+            id                    SERIAL PRIMARY KEY,
+            name                  TEXT NOT NULL,
+            url                   TEXT NOT NULL UNIQUE,
+            enabled               BOOLEAN NOT NULL DEFAULT true,
+            last_fetched_at       TIMESTAMPTZ,
+            sync_interval_minutes INTEGER NOT NULL DEFAULT 360,
+            max_articles          INTEGER NOT NULL DEFAULT 5,
+            category              TEXT
+          );
+          ALTER TABLE sources ADD COLUMN IF NOT EXISTS sync_interval_minutes INTEGER NOT NULL DEFAULT 360;
+          ALTER TABLE sources ADD COLUMN IF NOT EXISTS max_articles INTEGER NOT NULL DEFAULT 5;
+          ALTER TABLE sources ADD COLUMN IF NOT EXISTS category TEXT;
+
+          CREATE TABLE IF NOT EXISTS llm_config (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            url              TEXT NOT NULL DEFAULT '',
+            api_key          TEXT NOT NULL DEFAULT 'none',
+            summary_language TEXT NOT NULL DEFAULT 'German'
+          );
+          ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS url TEXT NOT NULL DEFAULT '';
+          ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS api_key TEXT NOT NULL DEFAULT 'none';
+          ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS summary_language TEXT NOT NULL DEFAULT 'German';
+          INSERT INTO llm_config (url, api_key, summary_language)
+          SELECT :'llm_url', 'none', 'German'
+          WHERE NOT EXISTS (SELECT 1 FROM llm_config);
+
+          CREATE TABLE IF NOT EXISTS articles (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            source_id        INTEGER REFERENCES sources(id) ON DELETE CASCADE,
+            title_original   TEXT,
+            url              TEXT NOT NULL UNIQUE,
+            summary_llm      TEXT,
+            category         TEXT,
+            title_translated TEXT,
+            llm_error        BOOLEAN NOT NULL DEFAULT false,
+            published_at     TIMESTAMPTZ,
+            fetched_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+          );
+          ALTER TABLE articles ADD COLUMN IF NOT EXISTS category TEXT;
+          ALTER TABLE articles ADD COLUMN IF NOT EXISTS title_translated TEXT;
+          CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY);
+          SQL
+
+      containers:
+
+      # ── Nginx ──────────────────────────────────
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
+        - name: nginx-config
+          mountPath: /error-pages/loading.html
+          subPath: loading.html
+
+      # ── Python Generator Sidecar ───────────────
+      - name: generator
+        image: python:3.12-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install -q feedparser requests psycopg2-binary
+          touch /html/.sync-now
+          while true; do
+            date +%s > /html/.generator-heartbeat
+            if [ -f /html/.sync-now ]; then
+              rm -f /html/.sync-now
+              echo "[$(date)] Full sync (forced)..."
+              python /scripts/news_feed_cyberpunk.py --force
+            else
+              for f in /html/.sync-feed-*; do
+                [ -f "$f" ] || continue
+                feed_id="${f#/html/.sync-feed-}"
+                rm -f "$f"
+                echo "[$(date)] Feed sync: $feed_id"
+                python /scripts/news_feed_cyberpunk.py --feed "$feed_id"
+              done
+              python /scripts/news_feed_cyberpunk.py
+            fi
+            sleep 60
+          done
+        env:
+        - name: LLM_BASE_URL
+          value: "http://localhost:11434/v1"
+        - name: OUTPUT_FILE
+          value: "/html/index.html"
+        - name: DB_HOST
+          value: "feedreader-db-cluster-rw"
+        - name: DB_NAME
+          value: "feedconfig"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: feeduser-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: feeduser-credentials
+              key: password
+        volumeMounts:
+        - name: html
+          mountPath: /html
+        - name: scripts
+          mountPath: /scripts
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "test $(( $(date +%s) - $(cat /html/.generator-heartbeat 2>/dev/null || echo 0) )) -lt 600"
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "768Mi"
+            cpu: "1000m"
+
+      # ── Flask API Sidecar ──────────────────────
+      - name: api-server
+        image: python:3.12-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install -q flask psycopg2-binary feedparser
+          python /scripts/api_server.py
+        env:
+        - name: OUTPUT_FILE
+          value: "/html/index.html"
+        - name: DB_HOST
+          value: "feedreader-db-cluster-rw"
+        - name: DB_NAME
+          value: "feedconfig"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: feeduser-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: feeduser-credentials
+              key: password
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: html
+          mountPath: /html
+        readinessProbe:
+          httpGet:
+            path: /api/sources
+            port: 5000
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /api/sources
+            port: 5000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "384Mi"
+            cpu: "500m"

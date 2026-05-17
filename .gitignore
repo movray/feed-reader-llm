@@ -1,0 +1,13 @@
+CONTEXT.md
+__pycache__/
+*.pyc
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Vim
+*.swp
+*.swo
+*.swn

@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: feedreader-ingress
+  namespace: feedreader
+  annotations:
+    cert-manager.io/issuer:       step-issuer
+    cert-manager.io/issuer-kind:  StepClusterIssuer
+    cert-manager.io/issuer-group: certmanager.step.sm
+spec:
+  ingressClassName: nginx
+  tls:
+    - secretName: feedreader-tls
+      hosts:
+        - news.hq.c1.itknecht.de
+  rules:
+    - host: news.hq.c1.itknecht.de
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: news-feed
+                port:
+                  number: 80

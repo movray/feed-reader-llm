@@ -1,0 +1,22 @@
+name: Mirror to Gitea
+
+on:
+  push:
+    branches: ["**"]
+  delete:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Gitea
+        run: |
+          git remote add gitea https://${{ secrets.GITEA_USER }}:${{ secrets.GITEA_TOKEN }}@git.itknecht.de/sugras/feed-reader-llm.git
+          git push gitea +HEAD:refs/heads/${{ github.ref_name }} --force
+          git push gitea --tags --force
