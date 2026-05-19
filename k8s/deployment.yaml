@@ -191,7 +191,7 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
-          pip install -q flask psycopg2-binary feedparser
+          pip install -q flask psycopg2-binary feedparser requests
           python /scripts/api_server.py
         env:
         - name: OUTPUT_FILE
