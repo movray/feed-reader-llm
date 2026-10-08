@@ -62,3 +62,19 @@
 - [x] **Configurable summary language** — language selector in CONF LLM dialog; LLM summarizes
       and translates titles into the selected language; language change resets all articles
       for re-translation
+
+- [x] **Model selection** — model field in CONF LLM dialog, stored in `llm_config.model`;
+      suggests the models from `/models` with their llama-server router status; connection
+      test checks the chosen model; empty = use the loaded model
+
+- [ ] **Configurable LLM timeout** — the summary call waits 60 s; in llama-server router mode
+      the first request may have to load the model first and time out (the article is retried
+      on the next sync); make the timeout a field in the CONF LLM dialog
+
+## LLM Robustness
+
+- [x] **Router mode support** — model detection uses the loaded model's `id` instead of
+      `aliases[0]` of the first entry; model names are no longer stripped of `/`, `:`, `.`
+
+- [x] **Retry failed LLM calls** — articles with `llm_error` are summarized again on the next
+      sync instead of keeping the error text forever
