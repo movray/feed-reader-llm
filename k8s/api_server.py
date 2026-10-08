@@ -401,21 +401,48 @@ def set_interval():
     return "", 204
 
 
-def _test_llm(url: str, api_key: str) -> str:
+def _list_models(url: str, api_key: str) -> list:
+    """Models from /models as (id, status) pairs. status is "" unless the server
+    is a llama-server in router mode, which lists all its models with a status."""
+    r = http_requests.get(
+        f"{url.rstrip('/')}/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=8,
+    )
+    r.raise_for_status()
+    return [(m.get("id", "?"), (m.get("status") or {}).get("value", ""))
+            for m in r.json().get("data", [])]
+
+
+def _test_llm(url: str, api_key: str, model: str) -> str:
     try:
-        r = http_requests.get(
-            f"{url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=8,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        if data:
-            model = data[0].get("id") or data[0].get("aliases", ["?"])[0]
-            return f"&#x2713; Connected &mdash; Model: {html.escape(str(model))}"
-        return "&#x2713; Connected (no models returned)"
+        models = _list_models(url, api_key)
     except Exception as e:
         return f"&#x26A0; Connection test failed: {html.escape(str(e))}"
+    if not models:
+        return "&#x2713; Connected (no models returned)"
+    if not model:
+        loaded = [m for m, st in models if st == "loaded"]
+        auto = loaded[0] if loaded else models[0][0]
+        return f"&#x2713; Connected &mdash; no model set, using {html.escape(auto)}"
+    status = dict(models)
+    if model not in status:
+        return f"&#x26A0; Connected, but the server has no model {html.escape(model)}"
+    note = ""
+    if status[model] and status[model] != "loaded":
+        note = f" ({html.escape(status[model])} &mdash; the router loads it on the first request)"
+    return f"&#x2713; Connected &mdash; Model: {html.escape(model)}{note}"
+
+
+def _model_options(url: str, api_key: str) -> str:
+    """<option>s for the model field's datalist; empty if the server is unreachable."""
+    try:
+        models = _list_models(url, api_key) if url else []
+    except Exception:
+        return ""
+    return "\n".join(
+        f'<option value="{html.escape(m)}">{html.escape(st)}</option>' for m, st in models
+    )
 
 
 def _lang_options(current: str) -> str:
@@ -428,9 +455,10 @@ def _lang_options(current: str) -> str:
 
 
 def render_llm_form(url: str = "", api_key: str = "", summary_language: str = "German",
-                    error: str = "", success: str = "", test_result: str = "") -> str:
+                    model: str = "", error: str = "", success: str = "", test_result: str = "") -> str:
     url_e    = html.escape(url)
     ak_e     = html.escape(api_key)
+    model_e  = html.escape(model)
     msg_html = ""
     if error:
         msg_html = f'<div class="add-error" style="margin-top:.5rem">&#x26A0; {html.escape(error)}</div>'
@@ -445,6 +473,9 @@ def render_llm_form(url: str = "", api_key: str = "", summary_language: str = "G
            placeholder="http://host:port/v1" value="{url_e}" required>
     <input class="cfg-input" style="width:180px" type="password" name="api_key"
            placeholder="API Key (or 'none')" value="{ak_e}">
+    <input class="cfg-input" style="width:300px" type="text" name="model" list="llm-models"
+           placeholder="Model (empty = the loaded one)" value="{model_e}">
+    <datalist id="llm-models">{_model_options(url, api_key)}</datalist>
     <select class="cfg-input" name="summary_language" style="width:180px">
       {_lang_options(summary_language)}
     </select>
@@ -461,16 +492,17 @@ def llm_form():
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT url, api_key, summary_language FROM llm_config LIMIT 1")
+        cur.execute("SELECT url, api_key, summary_language, model FROM llm_config LIMIT 1")
         row             = cur.fetchone()
         url             = row[0] if row else ""
         api_key         = row[1] if row else ""
         summary_language = row[2] if row else "German"
+        model           = row[3] if row else ""
     except Exception:
-        url, api_key, summary_language = "", "", "German"
+        url, api_key, summary_language, model = "", "", "German", ""
     finally:
         conn.close()
-    return render_llm_form(url, api_key, summary_language)
+    return render_llm_form(url, api_key, summary_language, model)
 
 
 @app.post("/api/llm-config")
@@ -478,6 +510,7 @@ def save_llm_config():
     url              = request.form.get("url", "").strip()
     api_key          = request.form.get("api_key", "none").strip() or "none"
     summary_language = request.form.get("summary_language", "German").strip()
+    model            = request.form.get("model", "").strip()
     if not url:
         return render_llm_form(error="URL is required.")
     conn = get_db()
@@ -487,24 +520,24 @@ def save_llm_config():
         row           = cur.fetchone()
         old_language  = row[0] if row else None
         cur.execute(
-            "UPDATE llm_config SET url = %s, api_key = %s, summary_language = %s",
-            (url, api_key, summary_language),
+            "UPDATE llm_config SET url = %s, api_key = %s, summary_language = %s, model = %s",
+            (url, api_key, summary_language, model),
         )
         if cur.rowcount == 0:
             cur.execute(
-                "INSERT INTO llm_config (url, api_key, summary_language) VALUES (%s, %s, %s)",
-                (url, api_key, summary_language),
+                "INSERT INTO llm_config (url, api_key, summary_language, model) VALUES (%s, %s, %s, %s)",
+                (url, api_key, summary_language, model),
             )
         if old_language and old_language != summary_language:
             cur.execute("UPDATE articles SET summary_llm = NULL, title_translated = NULL")
             print(f"Language changed {old_language} → {summary_language}: articles reset for re-translation")
         conn.commit()
     except Exception as e:
-        return render_llm_form(url, api_key, summary_language, error=f"DB error: {e}")
+        return render_llm_form(url, api_key, summary_language, model, error=f"DB error: {e}")
     finally:
         conn.close()
-    test_result = _test_llm(url, api_key)
-    return render_llm_form(url, api_key, summary_language, success="Saved. Active on next sync.", test_result=test_result)
+    test_result = _test_llm(url, api_key, model)
+    return render_llm_form(url, api_key, summary_language, model, success="Saved. Active on next sync.", test_result=test_result)
 
 
 @app.post("/api/max-articles")

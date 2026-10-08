@@ -134,6 +134,7 @@ id               UUID PRIMARY KEY DEFAULT gen_random_uuid()
 url              TEXT DEFAULT ''          -- populated from LLM_BASE_URL env var on first deploy
 api_key          TEXT DEFAULT 'none'
 summary_language TEXT DEFAULT 'German'
+model            TEXT DEFAULT ''          -- empty = detect from /models; set once from LLM_MODEL
 ```
 Always read with `SELECT ... LIMIT 1`. Write with UPDATE-then-INSERT upsert (never assume a fixed id).
 The initial URL comes from the generator's `LLM_BASE_URL` env var (single source of truth — init-db passes it to psql via `-v`).
@@ -154,9 +155,16 @@ id TEXT PRIMARY KEY   -- e.g. 'v1.9.0-cat-reset'
 ## LLM integration
 
 **Config loading** (`init_llm_config` in `news_feed_cyberpunk.py`):
-1. Read `url`, `api_key`, `summary_language` from `llm_config` table (`LIMIT 1`).
-2. Fall back to `LLM_BASE_URL` environment variable if the table read fails.
-3. Detect the active model via `GET /v1/models` — uses the first alias of the first result.
+1. Read `url`, `api_key`, `summary_language`, `model` from `llm_config` table (`LIMIT 1`).
+2. Fall back to the `LLM_BASE_URL` and `LLM_MODEL` environment variables if the table read fails.
+3. Without a model, `detect_model()` asks `GET /models`: the entry with `status.value == "loaded"`
+   (llama-server router mode lists all its models with a status), otherwise the first one. The
+   `id` is used unchanged — router model names contain `/`, `:` and `.`.
+
+**Failed calls** — `summarize_and_classify()` returns a `[Fehler …]` text and the article is
+stored with `llm_error = true`. Such articles count as not summarized: the next sync calls the LLM
+again, the backfills skip them, and the stranded-article cleanup removes them once they left the
+feed.
 
 **Summarization call** (`summarize_and_classify`):
 One API call per article produces a three-line response:
@@ -197,6 +205,9 @@ element.addEventListener('htmx:afterRequest', (event) => {
 ```
 
 **`sources.id` is SERIAL (integer), not UUID** — Flask routes must use `<block_id>` not `<int:block_id>`, since the same route also handles UUID-shaped parameters in some contexts. Don't mix up `sources.id` with `articles.id` (which is UUID).
+
+**Router model names** — never sanitize the model id (e.g. with a regex): the router only knows
+the exact name. Escape it with `html.escape` where it is rendered.
 
 **`llm_config.id` is UUID** — never use `WHERE id = 1` or `INSERT ... VALUES (1, ...)`. Use `SELECT ... LIMIT 1` to read and an UPDATE-then-INSERT upsert to write.
 

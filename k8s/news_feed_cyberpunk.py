@@ -21,7 +21,7 @@ from pathlib import Path
 
 LLM_BASE_URL      = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
 API_KEY           = "none"
-LLM_MODEL         = "unknown"
+LLM_MODEL         = os.environ.get("LLM_MODEL", "")  # empty = detect from /models
 SUMMARY_LANGUAGE  = "German"
 
 MAX_ARTICLES_PER_FEED = 5
@@ -40,24 +40,44 @@ def init_llm_config():
         conn = get_db_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT url, api_key, summary_language FROM llm_config LIMIT 1")
+            cur.execute("SELECT url, api_key, summary_language, model FROM llm_config LIMIT 1")
             row = cur.fetchone()
             if row and row[0]:
                 LLM_BASE_URL     = row[0]
                 API_KEY          = row[1] or "none"
                 SUMMARY_LANGUAGE = row[2] or "German"
+                LLM_MODEL        = row[3] or ""
                 print(f"  LLM-Config aus DB: {LLM_BASE_URL}, language: {SUMMARY_LANGUAGE}")
         finally:
             conn.close()
     except Exception as e:
         print(f"  LLM-Config DB-Fehler, nutze Env-Var: {e}")
+    if LLM_MODEL:
+        print(f"  LLM-Modell (konfiguriert): {LLM_MODEL}")
+        return
     try:
-        res = requests.get(f"{LLM_BASE_URL}/models").json()
-        raw = res["data"][0]["aliases"][0]
-        LLM_MODEL = re.sub(r"[^a-zA-Z0-9-]", "", raw)
-        print(f"  LLM-Modell: {LLM_MODEL}")
+        LLM_MODEL = detect_model()
+        print(f"  LLM-Modell (erkannt): {LLM_MODEL}")
     except Exception as e:
         print(f"  LLM-Modell konnte nicht ermittelt werden: {e}")
+
+
+def detect_model() -> str:
+    """Model id from /models. A llama-server in router mode lists all its models
+    with a status; prefer the loaded one so no other model gets loaded."""
+    res = requests.get(
+        f"{LLM_BASE_URL}/models",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        timeout=10,
+    )
+    res.raise_for_status()
+    data = res.json().get("data", [])
+    if not data:
+        raise ValueError("server lists no models")
+    for m in data:
+        if (m.get("status") or {}).get("value") == "loaded":
+            return m["id"]
+    return data[0]["id"]
 
 
 def get_db_connection():
@@ -116,9 +136,11 @@ def store_new_articles(source_id: str, rss_articles: list) -> int:
         cur = conn.cursor()
         urls = [a["url"] for a in rss_articles]
         # Nur Artikel mit vorhandener Summary als "fertig" betrachten —
-        # leere Summary (LLM-Leerantwort) wird beim nächsten Sync neu versucht.
+        # leere Summary (LLM-Leerantwort) und fehlgeschlagene LLM-Aufrufe
+        # werden beim nächsten Sync neu versucht.
         cur.execute(
-            "SELECT url FROM articles WHERE url = ANY(%s) AND summary_llm IS NOT NULL AND summary_llm != ''",
+            "SELECT url FROM articles WHERE url = ANY(%s) AND summary_llm IS NOT NULL AND summary_llm != '' "
+            "  AND NOT llm_error",
             (urls,),
         )
         existing = {row[0] for row in cur.fetchall()}
@@ -142,7 +164,8 @@ def store_new_articles(source_id: str, rss_articles: list) -> int:
                          category          = EXCLUDED.category,
                          title_translated  = EXCLUDED.title_translated,
                          llm_error         = EXCLUDED.llm_error
-                     WHERE articles.summary_llm IS NULL OR articles.summary_llm = ''""",
+                     WHERE articles.summary_llm IS NULL OR articles.summary_llm = ''
+                        OR articles.llm_error""",
                 (source_id, art["title"], art["url"], summary, category or None,
                  title_translated or None, llm_error, art["published_at"]),
             )
@@ -153,7 +176,7 @@ def store_new_articles(source_id: str, rss_articles: list) -> int:
         cur.execute(
             "SELECT id, title_original FROM articles "
             "WHERE source_id = %s AND category IS NULL "
-            "  AND summary_llm IS NOT NULL AND summary_llm != '' "
+            "  AND summary_llm IS NOT NULL AND summary_llm != '' AND NOT llm_error "
             "ORDER BY COALESCE(published_at, fetched_at) DESC LIMIT 20",
             (source_id,)
         )
@@ -172,7 +195,7 @@ def store_new_articles(source_id: str, rss_articles: list) -> int:
         cur.execute(
             "SELECT id, title_original FROM articles "
             "WHERE source_id = %s AND title_translated IS NULL "
-            "  AND summary_llm IS NOT NULL AND summary_llm != '' "
+            "  AND summary_llm IS NOT NULL AND summary_llm != '' AND NOT llm_error "
             "ORDER BY COALESCE(published_at, fetched_at) DESC LIMIT 20",
             (source_id,)
         )
@@ -186,13 +209,14 @@ def store_new_articles(source_id: str, rss_articles: list) -> int:
                 cur.execute("UPDATE articles SET title_translated = %s WHERE id = %s", (translated, art_id))
             conn.commit()
 
-        # Clean up stranded articles: NULL/empty summary AND no longer in current RSS feed.
-        # These will never be re-processed, so they just block display slots.
+        # Clean up stranded articles: NULL/empty summary or failed LLM call AND no
+        # longer in current RSS feed. These will never be re-processed, so they just
+        # block display slots.
         if rss_articles:
             current_urls = [a["url"] for a in rss_articles]
             cur.execute(
                 "DELETE FROM articles WHERE source_id = %s "
-                "  AND (summary_llm IS NULL OR summary_llm = '') "
+                "  AND (summary_llm IS NULL OR summary_llm = '' OR llm_error) "
                 "  AND url != ALL(%s)",
                 (source_id, current_urls),
             )
@@ -1390,7 +1414,7 @@ def write_shell(feeds: list, output_path: str):
         HTML_SHELL.format(
             date=now.strftime("%d.%m.%Y"),
             time=now.strftime("%H:%M"),
-            LLM_MODEL=LLM_MODEL,
+            LLM_MODEL=html.escape(LLM_MODEL or "unknown"),
             feed_slots=slots,
         ),
         encoding="utf-8",

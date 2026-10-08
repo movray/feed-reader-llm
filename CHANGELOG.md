@@ -6,6 +6,21 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.15.0] — 2026-10-08
+
+### Added
+- **Model selection** — `llm_config.model` column and a model field in the CONF LLM dialog; the field suggests the models from `/models`, with their status on a llama-server in router mode
+- `LLM_MODEL` env var (init-db and generator): written to `llm_config.model` once on existing deployments (migration `v1.15.0-llm-model`), generator fallback if the DB is unreachable
+- The CONF LLM connection test checks the chosen model and reports its router status
+
+### Fixed
+- llama-server router mode broke all summaries: model detection took `aliases[0]` of the first `/models` entry, which is empty on a router, so every request went out with model `unknown`; without a configured model the generator now uses the loaded model's `id`
+- Model names were stripped of `/`, `:` and `.`, so router model names like `org/model:Q4_K_M` never matched; the id is now used unchanged and HTML-escaped where shown
+- Articles whose LLM call failed were never retried: the `[Fehler …]` text counted as a summary; they are now summarized again on the next sync and skipped by the backfills
+- The CONF LLM connection test showed the first listed model instead of the one in use
+
+---
+
 ## [1.14.0] — 2026-05-06
 
 ### Added

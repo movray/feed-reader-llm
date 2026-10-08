@@ -132,6 +132,24 @@ Single-row table for LLM connection settings, editable via the CONF LLM dialog.
 | `url` | `TEXT` | OpenAI-compatible API base URL |
 | `api_key` | `TEXT` | API key (`none` if not required) |
 | `summary_language` | `TEXT` | Language for summaries and translated titles (default `German`) |
+| `model` | `TEXT` | Model sent with every LLM request; empty = detect it from `/models` |
+
+## Choosing the model
+
+The model is set in the CONF LLM dialog; the field suggests the models the server lists under
+`/models`, with their status on a llama-server in router mode. Saving tests the connection and
+checks that the server knows the model.
+
+With an empty model the generator detects one from `/models` on each run: the loaded model if the
+server reports a status (llama-server router mode), otherwise the first one listed.
+
+**llama-server router mode** (llama-server started without `-m`, serving several models): the
+router starts the requested model on demand. With `--models-max 1` it unloads the running model
+for it, so a fixed model makes the generator switch the router to that model on every sync where
+other clients use a different one. Leave the model empty to use whatever is loaded instead.
+
+If an LLM call fails (server unreachable, unknown model, timeout), the article is stored with
+`llm_error` and summarized again on the next sync.
 
 ## Getting Started
 
@@ -164,6 +182,7 @@ Edit these files before deploying:
 | File | What to change |
 |---|---|
 | `k8s/deployment.yaml` | `LLM_BASE_URL` — base URL of your LLM (e.g. `http://ollama.default.svc:11434/v1`) |
+| `k8s/deployment.yaml` | `LLM_MODEL` — model to use; empty = detect it (see [Choosing the model](#choosing-the-model)) |
 | `k8s/deployment.yaml` | `DB_HOST` — Kubernetes service name of your PostgreSQL instance |
 | `k8s/ingress.yaml` | `host` — your domain; TLS annotations to match your cert-manager / ingress setup |
 
@@ -229,6 +248,7 @@ Before deploying to a new cluster, adjust these values in `k8s/`:
 | File | Value | Description |
 |---|---|---|
 | `deployment.yaml` | `LLM_BASE_URL` | URL of your OpenAI-compatible LLM endpoint |
+| `deployment.yaml` | `LLM_MODEL` | Initial model; afterwards set in the CONF LLM dialog |
 | `deployment.yaml` | `DB_HOST` | CloudNative-PG cluster read-write service name |
 | `ingress.yaml` | host + TLS annotations | Adjust to your ingress controller and cert-manager setup |
 
@@ -254,6 +274,7 @@ ArgoCD runs `kustomize build` server-side. Because the ConfigMap name includes a
 | `DB_PASSWORD` | Database password (from secret) |
 | `DB_PORT` | PostgreSQL port (`5432`) |
 | `LLM_BASE_URL` | OpenAI-compatible LLM base URL |
+| `LLM_MODEL` | Model for LLM requests; init-db writes it to `llm_config.model` once, the generator uses it if the DB is unreachable |
 | `OUTPUT_FILE` | Output path for the shell HTML file (default: `news_zusammenfassung.html`) |
 
 ## API endpoints

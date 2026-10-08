@@ -46,6 +46,8 @@ spec:
               key: password
         - name: LLM_BASE_URL
           value: "http://localhost:11434/v1"
+        - name: LLM_MODEL
+          value: "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:Q4_K_XL"
         command:
         - sh
         - -c
@@ -54,7 +56,7 @@ spec:
             echo "Waiting for database..."
             sleep 2
           done
-          psql -v llm_url="$LLM_BASE_URL" <<'SQL'
+          psql -v llm_url="$LLM_BASE_URL" -v llm_model="$LLM_MODEL" <<'SQL'
           CREATE TABLE IF NOT EXISTS sources (
             id                    SERIAL PRIMARY KEY,
             name                  TEXT NOT NULL,
@@ -73,13 +75,15 @@ spec:
             id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             url              TEXT NOT NULL DEFAULT '',
             api_key          TEXT NOT NULL DEFAULT 'none',
-            summary_language TEXT NOT NULL DEFAULT 'German'
+            summary_language TEXT NOT NULL DEFAULT 'German',
+            model            TEXT NOT NULL DEFAULT ''
           );
           ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS url TEXT NOT NULL DEFAULT '';
           ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS api_key TEXT NOT NULL DEFAULT 'none';
           ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS summary_language TEXT NOT NULL DEFAULT 'German';
-          INSERT INTO llm_config (url, api_key, summary_language)
-          SELECT :'llm_url', 'none', 'German'
+          ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '';
+          INSERT INTO llm_config (url, api_key, summary_language, model)
+          SELECT :'llm_url', 'none', 'German', :'llm_model'
           WHERE NOT EXISTS (SELECT 1 FROM llm_config);
 
           CREATE TABLE IF NOT EXISTS articles (
@@ -97,6 +101,15 @@ spec:
           ALTER TABLE articles ADD COLUMN IF NOT EXISTS category TEXT;
           ALTER TABLE articles ADD COLUMN IF NOT EXISTS title_translated TEXT;
           CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY);
+
+          -- Existing deployments: set the model from LLM_MODEL once; afterwards
+          -- the CONF LLM dialog owns it (an empty model stays empty).
+          WITH m AS (
+            INSERT INTO _migrations (id) VALUES ('v1.15.0-llm-model')
+            ON CONFLICT DO NOTHING RETURNING id
+          )
+          UPDATE llm_config SET model = :'llm_model'
+          WHERE model = '' AND EXISTS (SELECT 1 FROM m);
           SQL
 
       containers:
@@ -145,6 +158,8 @@ spec:
         env:
         - name: LLM_BASE_URL
           value: "http://localhost:11434/v1"
+        - name: LLM_MODEL
+          value: "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:Q4_K_XL"
         - name: OUTPUT_FILE
           value: "/html/index.html"
         - name: DB_HOST
