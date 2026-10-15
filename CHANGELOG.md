@@ -6,6 +6,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.15.1] — 2026-10-15
+
+### Fixed
+- Empty summaries with reasoning models (e.g. Qwen3.6): thinking is on by default and used up the whole `max_tokens` budget, so the answer came back empty and the articles were hidden (a new feed showed 0 articles); all LLM requests now send `chat_template_kwargs: {"enable_thinking": false}`
+
+---
+
 ## [1.15.0] — 2026-10-08
 
 ### Added

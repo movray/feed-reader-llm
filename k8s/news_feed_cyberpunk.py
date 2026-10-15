@@ -23,6 +23,9 @@ LLM_BASE_URL      = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
 API_KEY           = "none"
 LLM_MODEL         = os.environ.get("LLM_MODEL", "")  # empty = detect from /models
 SUMMARY_LANGUAGE  = "German"
+# Reasoning models (e.g. Qwen3) think by default and burn the whole max_tokens
+# budget on reasoning, leaving the answer empty — disable thinking.
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 MAX_ARTICLES_PER_FEED = 5
 
@@ -342,6 +345,7 @@ def summarize_and_classify(title: str, text: str) -> tuple:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 350,
         "temperature": 0.3,
+        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
     }
     headers = {
         "Content-Type": "application/json",
@@ -372,6 +376,7 @@ def translate_title(title: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 80,
         "temperature": 0.1,
+        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
     try:
@@ -400,6 +405,7 @@ def classify_title(title: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 10,
         "temperature": 0.1,
+        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
     try:
