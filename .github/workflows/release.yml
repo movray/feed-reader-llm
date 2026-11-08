@@ -119,14 +119,21 @@ jobs:
             --output "type=oci,dest=$OUT/layout,tar=false" .
 
       # Nothing is published with a HIGH or CRITICAL finding, unfixed ones
-      # included, or with a secret in the image.
+      # included, or with a secret in the image. Each platform is copied out
+      # of the multi-arch layout first: Trivy's --platform does not pick a
+      # platform from the nested index buildx writes.
       - name: Scan the image
         run: |
           set -eu
           for p in $(echo "$PLATFORMS" | tr , ' '); do
+            arch="${p#linux/}"
             echo "== $p"
-            trivy image --input "$OUT/layout" --platform "$p" --scanners vuln,secret \
-              --severity HIGH,CRITICAL --exit-code 1 --no-progress
+            skopeo copy -q --override-os linux --override-arch "$arch" \
+              "oci:$OUT/layout" "oci:$OUT/scan-$arch"
+            skopeo inspect --config "oci:$OUT/scan-$arch" | jq -e --arg a "$arch" '.architecture == $a' > /dev/null \
+              || { echo "layout for $p has the wrong architecture" >&2; exit 1; }
+            trivy image --input "$OUT/scan-$arch" --scanners vuln,secret \
+              --severity HIGH,CRITICAL --exit-code 1 --no-progress --skip-version-check
           done
 
       - name: Log in to ghcr.io
