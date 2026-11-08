@@ -6,6 +6,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.16.1] — 2026-11-08
+
+### Fixed
+- `llm_config` could hold several (identical) rows; the migration keeps one and a unique index prevents further duplicates
+- The Gitea mirror workflow skips Dependabot runs, which get no Actions secrets and failed on every Dependabot pull request
+
+### Changed
+- Dependabot no longer proposes nginx minor updates (odd minors are mainline); compose and chart stay on the stable line
+
+---
+
 ## [1.16.0] — 2026-11-08
 
 ### Added

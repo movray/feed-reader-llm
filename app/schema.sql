@@ -31,6 +31,12 @@ ALTER TABLE llm_config ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '';
 INSERT INTO llm_config (url, api_key, summary_language, model)
 SELECT %(llm_url)s, 'none', 'German', %(llm_model)s
 WHERE NOT EXISTS (SELECT 1 FROM llm_config);
+-- llm_config holds exactly one row. Older versions could insert duplicates
+-- (all rows were updated together, so they are identical): keep the row
+-- that SELECT ... LIMIT 1 returned, then let the index refuse a second one.
+DELETE FROM llm_config
+WHERE id <> (SELECT id FROM llm_config ORDER BY ctid LIMIT 1);
+CREATE UNIQUE INDEX IF NOT EXISTS llm_config_single_row ON llm_config ((true));
 
 CREATE TABLE IF NOT EXISTS articles (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
