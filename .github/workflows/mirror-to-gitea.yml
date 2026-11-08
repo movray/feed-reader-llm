@@ -7,6 +7,9 @@ on:
 
 jobs:
   mirror:
+    # Dependabot runs get no Actions secrets (the Gitea login fails), and
+    # its branches need no mirror; its merges reach main as a normal push.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
