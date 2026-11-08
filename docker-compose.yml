@@ -66,7 +66,7 @@ services:
       start_period: 120s
 
   nginx:
-    image: nginxinc/nginx-unprivileged:1.30-alpine
+    image: nginxinc/nginx-unprivileged:1.31-alpine
     network_mode: service:api
     volumes:
       # nocopy: the volume must not be seeded with nginx's own index.html;
