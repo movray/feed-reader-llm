@@ -1,0 +1,24 @@
+feed-reader-llm {{ .Chart.AppVersion }} is installed as {{ include "feedreader.fullname" . }}.
+
+{{- if .Values.ingress.enabled }}
+
+Open: http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
+{{- else }}
+
+Open the page with a port-forward:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "feedreader.fullname" . }} 8080:{{ .Values.service.port }}
+  http://localhost:8080
+{{- end }}
+
+Add feeds with [CONFIG], set the LLM with [CONF LLM] (initial URL: {{ .Values.llm.baseUrl }}).
+{{- if .Values.postgresql.enabled }}
+
+The built-in PostgreSQL is meant for testing: one pod, no backups.
+{{- if .Values.postgresql.persistence.enabled }}
+Its volume and password secret are kept on uninstall; delete them by hand:
+  kubectl -n {{ .Release.Namespace }} delete pvc data-{{ include "feedreader.postgresql.fullname" . }}-0
+  kubectl -n {{ .Release.Namespace }} delete secret {{ include "feedreader.postgresql.fullname" . }}
+{{- else }}
+Its data lives in an emptyDir and is gone when the pod is deleted.
+{{- end }}
+{{- end }}

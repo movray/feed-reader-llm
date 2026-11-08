@@ -7,53 +7,64 @@ This document covers the internal architecture, component interactions, and conv
 ## Project layout
 
 ```
-k8s/
+app/
   news_feed_cyberpunk.py   # generator — fetches feeds, calls LLM, writes HTML
   api_server.py            # Flask API — config panel, block serving, sync triggers
-  nginx-default.conf       # nginx server config
-  nginx-loading.html       # loading page shown before first generator run
-  kustomization.yaml       # Kustomize — generates all ConfigMaps from source files
-  deployment.yaml          # Deployment + init-db init container (owns DB schema)
-  service.yaml
-  ingress.yaml
+  migrate.py               # applies schema.sql, waits for the database
+  schema.sql               # the whole DB schema and one-time data migrations
+  entrypoint.sh            # image entrypoint: migrate | generator | api | healthcheck-generator
+  requirements.in          # direct dependencies
+  requirements.txt         # lockfile with hashes (make lock)
+charts/feed-reader-llm/    # Helm chart
+  files/nginx-default.conf # nginx server config (also used by docker-compose.yml)
+  files/nginx-loading.html # loading page shown before the first generator run
+Dockerfile                 # one image for all app roles
+docker-compose.yml         # local test stack incl. PostgreSQL
+Makefile                   # lock, image, scan, up, down, lint, template
+.github/workflows/         # ci (checks, scan, smoke test, edge image), release, vuln (weekly)
+archive/                   # old standalone scripts, not used
 ```
-
-All files under `k8s/` are source files edited directly. There is no code generation step — Kustomize embeds the Python scripts and nginx files into ConfigMaps at deploy time (ArgoCD runs `kustomize build` on every sync).
 
 ---
 
 ## Kubernetes architecture
 
 ```
-Pod: news-feed (namespace: feedreader)
+Pod: <release>-feed-reader-llm
 │
-├── init-db (postgres:16-alpine)          runs to completion before app containers start
-│     └── creates / migrates all tables via psql heredoc
+├── migrate (feed-reader-llm image)       init container, runs to completion first
+│     └── waits for the DB, applies app/schema.sql (idempotent, under an advisory lock)
 │
-├── nginx (nginx:alpine) :80
+├── nginx (nginxinc/nginx-unprivileged) :8080
 │     ├── serves /html/index.html and /html/blocks/*.html from the shared volume
-│     ├── proxies /api/ → localhost:5000 (api-server)
+│     ├── proxies /api/ → 127.0.0.1:5000 (api)
+│     ├── /healthz for its probes
 │     └── returns loading.html on 403/404 (before index.html exists)
 │
-├── generator (python:3.12-slim)
-│     ├── shell loop: sleeps 60 s, runs generator every minute
+├── generator (feed-reader-llm image)
+│     ├── shell loop: runs the generator every 60 s
 │     ├── writes index.html shell + /html/blocks/<id>.html per feed
 │     └── liveness probe: /html/.generator-heartbeat must be < 10 min old
 │
-└── api-server (python:3.12-slim) :5000
-      ├── Flask API for the config panel and block serving
+└── api (feed-reader-llm image) :5000
+      ├── Flask API under gunicorn (2 workers × 4 threads)
       ├── writes trigger files to signal the generator
-      ├── readiness probe: GET /api/sources :5000 (holds traffic until Flask is up)
-      └── liveness probe: GET /api/sources :5000 (restarts on deadlock)
+      ├── readiness probe: GET /api/sources (holds traffic until the DB answers)
+      └── liveness probe: GET /api/sources (restarts on deadlock)
+
+Optional (postgresql.enabled=true): StatefulSet <release>-feed-reader-llm-postgresql
+with the official postgres image, for testing.
 ```
 
-**Shared volume:** `emptyDir` mounted at `/html` by all three app containers. This is the only communication channel between generator and api-server — no sockets, no queues.
+**Shared volume:** `emptyDir` (or a PVC with `html.persistence.enabled`) mounted at `/html` by
+all three app containers. This is the only communication channel between generator and API —
+no sockets, no queues. Hence `replicas: 1` and the `Recreate` strategy.
 
-**ConfigMaps:**
-- `news-feed-script` — contains `news_feed_cyberpunk.py` and `api_server.py`, mounted at `/scripts`
-- `nginx-config` — contains `default.conf` and `loading.html`
+**Security:** every container runs as non-root with a read-only root filesystem and no
+capabilities; writable paths are emptyDirs (`/tmp`, `/html`).
 
-Both ConfigMap names include a content hash (Kustomize `configMapGenerator`). Any committed change to the source files produces a new hash → Kubernetes triggers an automatic rolling update.
+**nginx config** lives in `charts/feed-reader-llm/files/` and becomes a ConfigMap; a checksum
+annotation restarts the pod when it changes.
 
 ---
 
@@ -92,13 +103,19 @@ The generator loop sleeps 60 s between iterations. On each tick it checks trigge
 
 ## Database schema
 
-PostgreSQL database `feedconfig`. The service name (`feedreader-db-cluster-rw`) and credentials secret (`feeduser-credentials`) are configured in `deployment.yaml` and should be adjusted to match your cluster setup.
+PostgreSQL database `feedconfig`. Host, name and credentials come from the chart values
+(`database.*`, or the built-in `postgresql.*`).
 
 ### Schema ownership
 
-**`init-db` (init container in `deployment.yaml`) owns all DDL.** It runs `CREATE TABLE IF NOT EXISTS` with the full current schema plus `ALTER TABLE IF NOT EXISTS` for backwards compatibility on existing deployments. This is the single source of truth — when adding a new column, only `deployment.yaml` needs updating.
+**`app/schema.sql` owns the whole schema**, applied by `app/migrate.py` (the `migrate` init
+container) on every start, in one transaction. It runs `CREATE TABLE IF NOT EXISTS` with the
+full current schema plus `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for existing deployments.
 
-**`api_server._migrate()` owns one-time data migrations only**, tracked via the `_migrations` table. Use `_run_once(id, stmts)` for any migration that must run exactly once against live data.
+**One-time data migrations** go at the end of `schema.sql` as a statement guarded by an
+`INSERT INTO _migrations ... ON CONFLICT DO NOTHING RETURNING id` CTE, so they run exactly once
+(see `v1.9.0-cat-reset`). The file is executed with psycopg2 parameters (`%(llm_url)s`,
+`%(llm_model)s`): a literal `%` must be written as `%%`.
 
 ### Tables
 
@@ -137,7 +154,7 @@ summary_language TEXT DEFAULT 'German'
 model            TEXT DEFAULT ''          -- empty = detect from /models; set once from LLM_MODEL
 ```
 Always read with `SELECT ... LIMIT 1`. Write with UPDATE-then-INSERT upsert (never assume a fixed id).
-The initial URL comes from the generator's `LLM_BASE_URL` env var (single source of truth — init-db passes it to psql via `-v`).
+The initial URL and model come from `LLM_BASE_URL` / `LLM_MODEL` (chart: `llm.baseUrl`, `llm.model`); `migrate.py` inserts them while the table is empty.
 
 **`_migrations`** — tracks one-time data migrations
 ```
@@ -146,7 +163,7 @@ id TEXT PRIMARY KEY   -- e.g. 'v1.9.0-cat-reset'
 
 ### Adding a new column
 
-1. Add the column to the `CREATE TABLE` statement in `deployment.yaml` (init-db).
+1. Add the column to the `CREATE TABLE` statement in `app/schema.sql`.
 2. Add an `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` below the `CREATE TABLE` in the same block (for existing deployments).
 3. That's it — no changes needed in the Python files unless the code references the column.
 
@@ -211,21 +228,53 @@ the exact name. Escape it with `html.escape` where it is rendered.
 
 **`llm_config.id` is UUID** — never use `WHERE id = 1` or `INSERT ... VALUES (1, ...)`. Use `SELECT ... LIMIT 1` to read and an UPDATE-then-INSERT upsert to write.
 
-**`_migrate()` is not the place for DDL** — schema changes go in `deployment.yaml` init-db. `_migrate()` is for one-time data operations only.
+**No schema changes in the Python code** — DDL and one-time data migrations go in `app/schema.sql` only. The API and the generator assume the schema exists.
 
-**Block files persist across pod restarts** — the `/html` volume is an `emptyDir`, so it starts empty on every pod start. The generator writes a fresh shell and blocks on its first run. During that window nginx serves `loading.html`.
+**Block files do not persist across pod restarts** — the `/html` volume is an `emptyDir` by default, so it starts empty on every pod start. The generator writes a fresh shell and blocks on its first run. During that window nginx serves `loading.html`.
 
 ---
 
 ## Local development
 
 ```bash
-pip install feedparser requests psycopg2-binary flask
-
-# Set DB and LLM env vars, then:
-python k8s/news_feed_cyberpunk.py          # full sync
-python k8s/news_feed_cyberpunk.py --feed 3 # single feed by source id
-python k8s/api_server.py                   # Flask dev server on :5000
+make up        # docker compose: PostgreSQL, migrate, generator, API, nginx → http://localhost:8080
+make down      # stop (docker compose down -v also removes the database)
+make scan      # build the image, Trivy gate as in the release
+make lint      # helm lint (both database modes)
+make lock      # regenerate app/requirements.txt after changing app/requirements.in
 ```
 
-The generator writes `index.html` and `blocks/` relative to `OUTPUT_FILE` (defaults to `news_zusammenfassung.html` in the working directory).
+The LLM for the compose stack: `LLM_BASE_URL=http://host.docker.internal:11434/v1 make up`
+(read on the first start only; afterwards the CONF LLM dialog).
+
+Without Docker:
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install --require-hashes -r app/requirements.txt
+export DB_HOST=... DB_PORT=5432 DB_NAME=feedconfig DB_USER=... DB_PASSWORD=...
+export OUTPUT_FILE=$PWD/html/index.html
+python app/migrate.py                       # schema
+python app/news_feed_cyberpunk.py           # full sync
+python app/news_feed_cyberpunk.py --feed 3  # single feed by source id
+python app/api_server.py                    # Flask dev server on :5000
+```
+
+The generator writes `index.html` and `blocks/` relative to `OUTPUT_FILE`.
+
+---
+
+## Releasing
+
+1. Add a section `## [X.Y.Z] — YYYY-MM-DD` to `CHANGELOG.md`.
+2. Set `version` and `appVersion` in `charts/feed-reader-llm/Chart.yaml` to `X.Y.Z`.
+3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+`release.yml` then builds the image for amd64 and arm64, scans it with Trivy (no HIGH or
+CRITICAL finding, unfixed ones included), pushes exactly the scanned image to
+`ghcr.io/movray/feed-reader-llm:X.Y.Z` and `:latest`, the chart to
+`oci://ghcr.io/movray/charts/feed-reader-llm`, signs both with cosign, adds build provenance and
+creates the GitHub release from the CHANGELOG section. Run the workflow by hand
+(workflow_dispatch) for a dry run that publishes nothing.
+
+`vuln.yml` scans `latest` and `edge` weekly; a red run means: rebuild or update and release.

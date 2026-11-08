@@ -1,0 +1,17 @@
+{{- if .Values.html.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "feedreader.fullname" . }}-html
+  labels:
+    {{- include "feedreader.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.html.persistence.accessModes | nindent 4 }}
+  {{- with .Values.html.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.html.persistence.size }}
+{{- end }}
