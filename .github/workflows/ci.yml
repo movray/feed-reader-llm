@@ -1,0 +1,143 @@
+name: ci
+# Every push and pull request: static checks, the chart, the image (built,
+# scanned with Trivy and started with docker compose). A push to main also
+# publishes the image as ghcr.io/movray/feed-reader-llm:edge (signed);
+# releases come from release.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/movray/feed-reader-llm
+  CHART: charts/feed-reader-llm
+  # Keep in line with release.yml.
+  BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.34.2
+  COSIGN_VERSION: v3.1.4
+  COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+  HELM_VERSION: v3.19.0
+  HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+  TRIVY_VERSION: 0.76.1
+  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tools
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          curl -fsSL --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors \
+            -o helm.tgz "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz"
+          echo "$HELM_SHA256  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz --strip-components=1 linux-amd64/helm
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - name: Python syntax
+        run: python3 -m py_compile app/*.py
+      - name: Shell
+        run: shellcheck app/entrypoint.sh
+      - name: Lockfile matches requirements.in
+        run: |
+          set -eu
+          # Every direct dependency is pinned in requirements.txt at the same version.
+          grep -E '^[a-z]' app/requirements.in | while read -r req; do
+            grep -q "^$req " app/requirements.txt || { echo "$req is not in app/requirements.txt, run make lock" >&2; exit 1; }
+          done
+      - name: Chart
+        run: |
+          set -eu
+          helm lint "$CHART" --strict --set database.host=db --set database.existingSecret=db
+          helm lint "$CHART" --strict --set postgresql.enabled=true
+          helm template t "$CHART" --set postgresql.enabled=true --set ingress.enabled=true --set ingress.tls.enabled=true > /dev/null
+          helm template t "$CHART" --set database.host=db --set database.user=u --set database.password=p > /dev/null
+          # Without a database the chart must refuse to render.
+          if helm template t "$CHART" > /dev/null 2>&1; then
+            echo "the chart rendered without database settings" >&2; exit 1
+          fi
+      - name: docker compose file
+        run: docker compose config -q
+
+  image:
+    runs-on: ubuntu-latest
+    needs: check
+    permissions:
+      contents: read
+      packages: write # edge image on ghcr.io (push to main only)
+      id-token: write # keyless signature (push to main only)
+    env:
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tools
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          get() { curl -fsSL --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors -o "$1" "$2"; }
+          get trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "$TRIVY_SHA256  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy
+          get cosign "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign-linux-amd64"
+          echo "$COSIGN_SHA256  cosign" | sha256sum -c -
+          chmod +x cosign
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: docker build --build-arg "VERSION=edge-${GITHUB_SHA::7}" -t feed-reader-llm:dev .
+
+      - name: Scan
+        run: |
+          trivy image --scanners vuln,secret --severity HIGH,CRITICAL \
+            --exit-code 1 --no-progress feed-reader-llm:dev
+
+      # The whole stack from docker-compose.yml: migration, generator, API
+      # behind nginx, against PostgreSQL.
+      - name: Smoke test
+        run: |
+          set -eu
+          docker compose up -d --no-build
+          for _ in $(seq 1 60); do
+            curl -fsS http://localhost:8080/healthz > /dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS http://localhost:8080/api/sources > /dev/null
+          # The generator writes the page shell on its first run.
+          for _ in $(seq 1 30); do
+            docker compose exec -T api test -f /html/index.html && break
+            sleep 2
+          done
+          curl -fsS http://localhost:8080/ | grep -q '</html>'
+          test "$(docker compose ps -q --status running | wc -l)" -eq 4
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color; docker compose down -v
+
+      - name: Publish edge
+        if: env.PUSH == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "$GITHUB_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker run --privileged --rm "$BINFMT_IMAGE" --install arm64
+          docker buildx create --use --name edge --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE"
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --provenance=false --sbom=false \
+            --build-arg "VERSION=edge-${GITHUB_SHA::7}" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file "$RUNNER_TEMP/meta.json" \
+            -t "$IMAGE:edge" --push .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")"
+          cosign sign --yes "$IMAGE@$digest"

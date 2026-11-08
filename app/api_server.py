@@ -39,51 +39,6 @@ def get_db():
     )
 
 
-def _run_once(migration_id: str, stmts: list):
-    """Run SQL statements exactly once, tracked via _migrations table."""
-    conn = None
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM _migrations WHERE id = %s", (migration_id,))
-        if cur.fetchone():
-            return
-        for stmt in stmts:
-            cur.execute(stmt)
-        cur.execute("INSERT INTO _migrations (id) VALUES (%s)", (migration_id,))
-        conn.commit()
-        print(f"Migration {migration_id}: done")
-    except Exception as e:
-        print(f"Migration {migration_id}: {e}")
-    finally:
-        if conn:
-            try: conn.close()
-            except Exception: pass
-
-
-def _migrate():
-    # Schema (DDL) is owned by the init-db init container in deployment.yaml.
-    # Only one-time data migrations belong here via _run_once.
-    conn = None
-    try:
-        conn = get_db()
-        conn.cursor().execute("CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY)")
-        conn.commit()
-    except Exception as e:
-        print(f"Migration: _migrations table → {e}")
-    finally:
-        if conn:
-            try: conn.close()
-            except Exception: pass
-
-    _run_once("v1.9.0-cat-reset", [
-        "UPDATE articles SET category = NULL",
-        "UPDATE sources SET category = NULL",
-    ])
-
-_migrate()
-
-
 def _loading_slot(feed_id: str, feed_name: str, category: str = "") -> str:
     name_e = html.escape(feed_name)
     cat_attr = f' data-categories="{html.escape(category)}"' if category else ''
@@ -330,8 +285,8 @@ def block(block_id):
     )
 
 
-SYNC_TRIGGER     = Path("/html/.sync-now")
-SYNC_FEED_PREFIX = "/html/.sync-feed-"
+SYNC_TRIGGER     = Path(OUTPUT_FILE).parent / ".sync-now"
+SYNC_FEED_PREFIX = str(Path(OUTPUT_FILE).parent / ".sync-feed-")
 
 
 @app.post("/api/sync/<feed_id>")
@@ -561,4 +516,5 @@ def set_max_articles():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Development only; the image runs the app under gunicorn.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

@@ -1,0 +1,165 @@
+# Default values of feed-reader-llm.
+#
+# The app needs a PostgreSQL database: an existing one (database.*), or for
+# testing the small built-in one (postgresql.enabled=true).
+
+image:
+  repository: ghcr.io/movray/feed-reader-llm
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # Takes precedence over tag, e.g. sha256:...
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# LLM used on the first start: written to the llm_config table only while it
+# is empty. Afterwards the CONF LLM dialog of the web UI owns these settings.
+llm:
+  # OpenAI-compatible API base URL (llama-server, Ollama, vLLM, ...).
+  baseUrl: "http://localhost:11434/v1"
+  # Empty: the generator uses the model the server reports as loaded, or the
+  # first one listed under /models.
+  model: ""
+
+# External PostgreSQL database (used when postgresql.enabled is false).
+database:
+  host: ""
+  port: 5432
+  name: feedconfig
+  # Credentials: either an existing secret ...
+  existingSecret: ""
+  userKey: username
+  passwordKey: password
+  # ... or user and password here (the chart creates a secret from them).
+  user: ""
+  password: ""
+
+# Built-in PostgreSQL for testing and small setups: a single pod with the
+# official postgres image, no replication and no backups. For production use
+# an operator such as CloudNativePG and set database.* instead.
+postgresql:
+  enabled: false
+  image:
+    repository: postgres
+    tag: 18-alpine
+    pullPolicy: IfNotPresent
+  auth:
+    database: feedconfig
+    username: feedreader
+    # Empty: a random password is generated and kept across upgrades.
+    password: ""
+    # Existing secret with the key "password"; overrides auth.password.
+    existingSecret: ""
+  persistence:
+    # false: emptyDir, the data is gone with the pod.
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Generated HTML (page shell and one block per feed). An emptyDir is enough:
+# the generator rewrites everything from the database after a restart; a
+# volume only keeps the page visible during that first sync.
+html:
+  persistence:
+    enabled: false
+    size: 256Mi
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+
+generator:
+  extraEnv: []
+  livenessProbe:
+    enabled: true
+    # Restart when the loop wrote no heartbeat for this long (hung sync).
+    maxAgeSeconds: 600
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+api:
+  # gunicorn
+  workers: 2
+  threads: 4
+  timeout: 60
+  extraEnv: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 384Mi
+
+migrate:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
+nginx:
+  image:
+    repository: nginxinc/nginx-unprivileged
+    tag: 1.30-alpine
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 64Mi
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # cert-manager.io/cluster-issuer: letsencrypt
+  host: feedreader.example.com
+  path: /
+  tls:
+    enabled: false
+    # Defaults to <fullname>-tls.
+    secretName: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

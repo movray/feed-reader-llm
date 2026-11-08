@@ -1,0 +1,40 @@
+name: vuln
+# Weekly Trivy scan of the published images: new advisories appear without
+# a change to feed-reader-llm. A red run means: rebuild (base image, apk)
+# or update a dependency, then release.
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trivy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [latest, edge]
+    env:
+      TRIVY_VERSION: 0.76.1
+      TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+    steps:
+      - name: Trivy
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          curl -fsSL --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors \
+            -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "$TRIVY_SHA256  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy
+      - name: Scan ghcr.io/movray/feed-reader-llm:${{ matrix.tag }}
+        run: |
+          for p in linux/amd64 linux/arm64; do
+            echo "== $p"
+            "$RUNNER_TEMP/trivy" image --platform "$p" --scanners vuln \
+              --severity HIGH,CRITICAL --exit-code 1 --no-progress \
+              "ghcr.io/movray/feed-reader-llm:${{ matrix.tag }}" || rc=1
+          done
+          exit "${rc:-0}"

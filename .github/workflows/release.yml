@@ -1,0 +1,218 @@
+name: release
+# A tag v* publishes a release: the multi-arch image (linux/amd64, arm64) and
+# the Helm chart on ghcr.io, signed with cosign (keyless) and with build
+# provenance from GitHub, plus a GitHub release with the CHANGELOG section.
+# Started by hand, the workflow builds and scans everything as a dry run and
+# publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # GitHub release
+      packages: write # image and chart on ghcr.io
+      id-token: write # keyless signatures and attestations
+      attestations: write
+    env:
+      PUBLISH: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+      IMAGE: ghcr.io/movray/feed-reader-llm
+      CHART_REPO: oci://ghcr.io/movray/charts
+      CHART: charts/feed-reader-llm
+      PLATFORMS: linux/amd64,linux/arm64
+      # Keep in line with ci.yml and the Makefile.
+      BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+      BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.34.2
+      COSIGN_VERSION: v3.1.4
+      COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+      HELM_VERSION: v3.19.0
+      HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+      TRIVY_VERSION: 0.76.1
+      TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Tools
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          get() { curl -fsSL --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors -o "$1" "$2"; }
+          get cosign "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign-linux-amd64"
+          echo "$COSIGN_SHA256  cosign" | sha256sum -c -
+          chmod +x cosign
+          get helm.tgz "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz"
+          echo "$HELM_SHA256  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz --strip-components=1 linux-amd64/helm
+          get trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "$TRIVY_SHA256  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          # skopeo comes with the runner image.
+          skopeo --version
+
+      - name: Version
+        run: |
+          set -eu
+          if [ "$PUBLISH" = true ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-dev.$(git rev-parse --short HEAD)"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+
+      # The section "## [X.Y.Z]" of CHANGELOG.md is the release notes.
+      # Required for a final release, optional for pre-releases. The dry run
+      # uses the topmost section: what the next tag publishes.
+      - name: Release notes
+        run: |
+          set -eu
+          h="## [$VERSION]"
+          [ "$PUBLISH" = true ] || h="$(grep -m1 '^## \[' CHANGELOG.md | sed 's/\].*/]/' || true)"
+          awk -v h="$h" 'index($0, h) == 1 {f = 1; next} /^## / {f = 0} f' CHANGELOG.md \
+            | sed '/^---$/d' > "$OUT/notes.md"
+          if [ -s "$OUT/notes.md" ]; then
+            echo "NOTES=$OUT/notes.md" >> "$GITHUB_ENV"
+            cat "$OUT/notes.md"
+          elif [ "$PUBLISH" = true ]; then
+            case "$VERSION" in
+              *-*) echo "no section [$VERSION] in CHANGELOG.md (pre-release, left out)" ;;
+              *) echo "CHANGELOG.md has no section ## [$VERSION]" >&2; exit 1 ;;
+            esac
+          fi
+
+      - name: Chart version matches the tag
+        if: env.PUBLISH == 'true'
+        run: |
+          set -eu
+          v="$(sed -n 's/^version: *//p' "$CHART/Chart.yaml")"
+          case "$VERSION" in *-*) exit 0 ;; esac
+          if [ "$v" != "$VERSION" ]; then
+            echo "$CHART/Chart.yaml has version $v, the tag is $VERSION" >&2
+            exit 1
+          fi
+
+      # Build both platforms into a local OCI layout. That layout is scanned
+      # and then copied to ghcr.io as is, so the published digest is the
+      # scanned one.
+      - name: Build the image
+        run: |
+          set -eu
+          docker run --privileged --rm "$BINFMT_IMAGE" --install arm64
+          docker buildx create --use --name release --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE"
+          docker buildx build --platform "$PLATFORMS" \
+            --provenance=false --sbom=false \
+            --build-arg "VERSION=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --output "type=oci,dest=$OUT/layout,tar=false" .
+
+      # Nothing is published with a HIGH or CRITICAL finding, unfixed ones
+      # included, or with a secret in the image.
+      - name: Scan the image
+        run: |
+          set -eu
+          for p in $(echo "$PLATFORMS" | tr , ' '); do
+            echo "== $p"
+            trivy image --input "$OUT/layout" --platform "$p" --scanners vuln,secret \
+              --severity HIGH,CRITICAL --exit-code 1 --no-progress
+          done
+
+      - name: Log in to ghcr.io
+        if: env.PUBLISH == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "$GITHUB_TOKEN" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "$GITHUB_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # Image and chart first: the GitHub release names both, so it is only
+      # created once they exist.
+      - name: Push the image
+        if: env.PUBLISH == 'true'
+        run: |
+          set -eu
+          skopeo copy --all --preserve-digests --digestfile "$OUT/digest" \
+            "oci:$OUT/layout" "docker://$IMAGE:$VERSION"
+          digest="$(cat "$OUT/digest")"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "no digest from skopeo: $digest" >&2; exit 1 ;;
+          esac
+          # Pre-releases (1.0.0-rc.1) do not move latest.
+          case "$VERSION" in
+            *-*) ;;
+            *) skopeo copy --all --preserve-digests "docker://$IMAGE@$digest" "docker://$IMAGE:latest" ;;
+          esac
+          echo "image: $IMAGE@$digest"
+          echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: Sign the image
+        if: env.PUBLISH == 'true'
+        run: cosign sign --yes "$IMAGE@$IMAGE_DIGEST"
+      - name: Image provenance
+        if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+
+      - name: Chart
+        run: |
+          set -eu
+          helm lint "$CHART" --set database.host=db --set database.existingSecret=db
+          helm lint "$CHART" --set postgresql.enabled=true
+          helm package "$CHART" --version "$VERSION" --app-version "$VERSION" -d "$OUT"
+          if [ "$PUBLISH" = true ]; then
+            helm push "$OUT/feed-reader-llm-$VERSION.tgz" "$CHART_REPO" 2>&1 | tee "$OUT/helm-push.log"
+            digest="$(sed -n 's/^Digest: //p' "$OUT/helm-push.log")"
+            [ -n "$digest" ] || { echo "no chart digest in the helm push output" >&2; exit 1; }
+            echo "CHART_DIGEST=$digest" >> "$GITHUB_ENV"
+          fi
+
+      - name: Sign the chart
+        if: env.PUBLISH == 'true'
+        run: cosign sign --yes "${CHART_REPO#oci://}/feed-reader-llm@$CHART_DIGEST"
+      - name: Chart provenance
+        if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/movray/charts/feed-reader-llm
+          subject-digest: ${{ env.CHART_DIGEST }}
+          push-to-registry: true
+
+      - name: GitHub release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          {
+            [ -n "${NOTES:-}" ] && cat "$NOTES" && echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "helm install feedreader $CHART_REPO/feed-reader-llm --version $VERSION -n feedreader --create-namespace -f my-values.yaml"
+            echo '```'
+            echo
+            echo "- Image: \`$IMAGE:$VERSION\` (\`$IMAGE_DIGEST\`)"
+            echo "- Chart: \`${CHART_REPO#oci://}/feed-reader-llm:$VERSION\` (\`$CHART_DIGEST\`)"
+          } > "$OUT/release.md"
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+            --notes-file "$OUT/release.md" --verify-tag $prerelease \
+            "$OUT/feed-reader-llm-$VERSION.tgz"

@@ -1,0 +1,11 @@
+apiVersion: v2
+name: feed-reader-llm
+description: RSS feed aggregator that summarizes articles with a local LLM (OpenAI-compatible API) and serves them as a cyberpunk-styled page
+type: application
+# Chart and app share the version; the release workflow sets both from the git tag.
+version: 1.16.0
+appVersion: "1.16.0"
+home: https://github.com/movray/feed-reader-llm
+sources:
+  - https://github.com/movray/feed-reader-llm
+keywords: [rss, feed-reader, llm, summarization, self-hosted]

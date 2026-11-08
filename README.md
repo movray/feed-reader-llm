@@ -21,28 +21,36 @@ Experimental RSS feed aggregator that summarizes articles in different languages
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Kubernetes Pod (namespace: feedreader)         │
-│                                                 │
-│  ┌──────────┐   /html volume   ┌─────────────┐  │
-│  │  nginx   │◄────────────────►│  generator  │  │
-│  │  :80     │                  │  (cron loop)│  │
-│  └────┬─────┘                  └─────────────┘  │
-│       │ /api/ proxy                             │
-│       ▼                                         │
-│  ┌─────────────┐               ┌─────────────┐  │
-│  │ api-server  │◄──/html vol──►│ PostgreSQL  │  │
-│  │ Flask :5000 │               │  (external) │  │
-│  └─────────────┘               └─────────────┘  │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  Pod                                                 │
+│                                                      │
+│  ┌───────────┐   /html volume   ┌──────────────┐     │
+│  │  nginx    │◄────────────────►│  generator   │     │
+│  │  :8080    │                  │  (60 s loop) │──┐  │
+│  └────┬──────┘                  └──────────────┘  │  │
+│       │ /api/ proxy                               │  │
+│       ▼                                           ▼  │
+│  ┌──────────────┐                  ┌────────────┐    │
+│  │ api (Flask,  │◄──/html volume──►│ PostgreSQL │    │
+│  │ gunicorn)    │─────────────────►│ (external) │    │
+│  │ :5000        │                  └────────────┘    │
+│  └──────────────┘                                    │
+└──────────────────────────────────────────────────────┘
 ```
+
+All app roles come from one image, `ghcr.io/movray/feed-reader-llm`; the first
+argument picks the role (`app/entrypoint.sh`).
 
 | Container | Image | Role |
 |---|---|---|
-| `init-db` | `postgres:16-alpine` | Init container — creates `sources` table if it does not exist |
-| `nginx` | `nginx:alpine` | Serves `index.html` shell and block files, proxies `/api/` to Flask |
-| `generator` | `python:3.12-slim` | Fetches feeds, calls LLM for new articles, writes shell and per-feed block files |
-| `api-server` | `python:3.12-slim` | Flask REST API for the config panel and block serving |
+| `migrate` | `ghcr.io/movray/feed-reader-llm` | Init container — waits for the database, creates or updates the schema (`app/schema.sql`) |
+| `nginx` | `nginxinc/nginx-unprivileged` | Serves `index.html` shell and block files, proxies `/api/` to the API |
+| `generator` | `ghcr.io/movray/feed-reader-llm` | Fetches feeds, calls LLM for new articles, writes shell and per-feed block files |
+| `api` | `ghcr.io/movray/feed-reader-llm` | Flask REST API (gunicorn) for the config panel and block serving |
+
+The image is based on `python:3.13-alpine`, runs as a non-root user and
+contains no pip; every release is scanned with Trivy (no HIGH or CRITICAL
+finding, unfixed ones included), signed with cosign and has build provenance.
 
 ### Render flow
 
@@ -92,7 +100,7 @@ An article URL is the stable unique identifier. If it is already in the `article
 
 ## Database
 
-PostgreSQL database `feedconfig`. The `init-db` init container creates the `sources` table automatically on first deploy via `CREATE TABLE IF NOT EXISTS`.
+PostgreSQL database `feedconfig`. The `migrate` init container creates and updates all tables on every start (`app/schema.sql`, idempotent).
 
 ### `sources` table (active)
 
@@ -157,125 +165,128 @@ If an LLM call fails (server unreachable, unknown model, timeout), the article i
 
 | Requirement | Notes |
 |---|---|
-| Kubernetes cluster | Tested on k3s / kubeadm |
-| PostgreSQL | [CloudNative-PG](https://cloudnative-pg.io/) recommended; any PostgreSQL reachable inside the cluster works |
+| Kubernetes ≥ 1.25 and Helm 3.8+ | or Docker with Compose for a local test |
+| PostgreSQL | [CloudNative-PG](https://cloudnative-pg.io/) recommended; any PostgreSQL reachable from the pod works. For a test, the chart can start a small one. |
 | OpenAI-compatible LLM | [Ollama](https://ollama.com/), llama.cpp server, LM Studio, or any hosted API |
-| ArgoCD **or** kubectl ≥ 1.14 | ArgoCD for GitOps; plain `kubectl apply -k` also works |
 
-### 1 — Create the namespace and database secret
+### Quick test with docker compose
+
+```bash
+git clone https://github.com/movray/feed-reader-llm && cd feed-reader-llm
+LLM_BASE_URL=http://host.docker.internal:11434/v1 docker compose up --build -d
+# http://localhost:8080
+```
+
+This starts PostgreSQL, the migration, generator, API and nginx. `docker compose down -v`
+removes everything including the database.
+
+### Quick test on Kubernetes (built-in PostgreSQL)
+
+```bash
+helm install feedreader oci://ghcr.io/movray/charts/feed-reader-llm \
+  -n feedreader --create-namespace \
+  --set postgresql.enabled=true \
+  --set llm.baseUrl=http://ollama.ollama.svc:11434/v1
+kubectl -n feedreader port-forward svc/feedreader-feed-reader-llm 8080:80
+```
+
+The built-in PostgreSQL is a single pod with the official `postgres` image, a 1 Gi volume
+and a generated password: fine for testing, not for production (no backups, no replication).
+
+### Install with an existing PostgreSQL
+
+Create a secret with the database credentials (or let the chart create one from
+`database.user` / `database.password`):
 
 ```bash
 kubectl create namespace feedreader
-
-kubectl create secret generic feeduser-credentials \
-  --namespace feedreader \
-  --from-literal=username=<db-user> \
-  --from-literal=password=<db-password>
+kubectl -n feedreader create secret generic feeduser-credentials \
+  --from-literal=username=<db-user> --from-literal=password=<db-password>
 ```
 
-The database itself must already exist and be reachable as a Kubernetes service. The init container creates all tables automatically on first start.
+`my-values.yaml`:
 
-### 2 — Adjust cluster-specific values
+```yaml
+llm:
+  baseUrl: http://ollama.ollama.svc:11434/v1   # initial value, see below
+  model: ""                                    # empty = use the loaded model
 
-Edit these files before deploying:
+database:
+  host: feedreader-db-cluster-rw               # e.g. the CloudNative-PG rw service
+  name: feedconfig
+  existingSecret: feeduser-credentials
 
-| File | What to change |
-|---|---|
-| `k8s/deployment.yaml` | `LLM_BASE_URL` — base URL of your LLM (e.g. `http://ollama.default.svc:11434/v1`) |
-| `k8s/deployment.yaml` | `LLM_MODEL` — model to use; empty = detect it (see [Choosing the model](#choosing-the-model)) |
-| `k8s/deployment.yaml` | `DB_HOST` — Kubernetes service name of your PostgreSQL instance |
-| `k8s/ingress.yaml` | `host` — your domain; TLS annotations to match your cert-manager / ingress setup |
+ingress:
+  enabled: true
+  className: nginx
+  host: news.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  tls:
+    enabled: true
+```
 
-### 3 — Deploy
+```bash
+helm install feedreader oci://ghcr.io/movray/charts/feed-reader-llm \
+  --version <version> -n feedreader -f my-values.yaml
+```
 
-**Via ArgoCD** — create an Application pointing at this repo with `path: k8s`:
+The database must exist; the `migrate` init container creates all tables on the first start
+and updates the schema on upgrades. All options are documented in
+[`charts/feed-reader-llm/values.yaml`](charts/feed-reader-llm/values.yaml).
+
+`llm.baseUrl` and `llm.model` are written to the `llm_config` table only while it is empty.
+Afterwards the `[CONF LLM]` dialog owns these settings; changing the values does not
+overwrite them.
+
+**ArgoCD**: an Application with the chart as source:
 
 ```yaml
 source:
-  repoURL: https://github.com/your-fork/feed-reader-llm
-  targetRevision: main
-  path: k8s
-destination:
-  server: https://kubernetes.default.svc
-  namespace: feedreader
+  repoURL: ghcr.io/movray/charts
+  chart: feed-reader-llm
+  targetRevision: <version>
+  helm:
+    valuesObject:
+      database:
+        host: feedreader-db-cluster-rw
+        existingSecret: feeduser-credentials
 ```
 
-ArgoCD detects the `kustomization.yaml` automatically and runs `kustomize build` on each sync.
+### Add your first feeds
 
-**Via kubectl**:
+Open the page, click `[CONFIG]` in the top-right corner and add RSS feed URLs. The generator
+picks them up on its next 60-second tick. To trigger an immediate sync, click `[SYNC NOW]`.
+
+### Verify a release
+
+Image and chart are signed with cosign (keyless) and have build provenance from GitHub:
 
 ```bash
-kubectl apply -k k8s/
+gh attestation verify oci://ghcr.io/movray/feed-reader-llm:<version> -R movray/feed-reader-llm
+gh attestation verify oci://ghcr.io/movray/charts/feed-reader-llm:<version> -R movray/feed-reader-llm
+
+cosign verify ghcr.io/movray/feed-reader-llm:<version> \
+  --certificate-identity-regexp '^https://github.com/movray/feed-reader-llm/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-### 4 — Add your first feeds
-
-Once the pod is running, open the URL you configured in `ingress.yaml`. Click `[CONFIG]` in the top-right corner and add RSS feed URLs. The generator picks them up on its next 60-second tick.
-
-To trigger an immediate sync, click `[SYNC NOW]`.
-
----
-
-## Deployment
-
-The project runs on Kubernetes via ArgoCD. All manifests are in `k8s/`.
-
-### Files
-
-| File | Purpose |
-|---|---|
-| `k8s/news_feed_cyberpunk.py` | Main generator script |
-| `k8s/api_server.py` | Flask config and block API |
-| `k8s/nginx-default.conf` | nginx server config |
-| `k8s/nginx-loading.html` | Loading page served while the generator runs |
-| `k8s/kustomization.yaml` | Kustomize config — generates all ConfigMaps from the source files |
-| `k8s/deployment.yaml` | Deployment (init container owns the full DB schema) |
-| `k8s/service.yaml` | Service |
-| `k8s/ingress.yaml` | Ingress — adjust host and TLS issuer for your cluster |
-
-### First deploy
-
-Point an ArgoCD Application at this repo with `path: k8s`. On first sync:
-
-1. The init container connects to PostgreSQL and creates the `sources` table.
-2. The generator and API server start — the page shows the loading screen until the first run completes.
-3. Add RSS sources via the `[CONFIG]` button in the web UI.
-
-### Cluster-specific values
-
-Before deploying to a new cluster, adjust these values in `k8s/`:
-
-| File | Value | Description |
-|---|---|---|
-| `deployment.yaml` | `LLM_BASE_URL` | URL of your OpenAI-compatible LLM endpoint |
-| `deployment.yaml` | `LLM_MODEL` | Initial model; afterwards set in the CONF LLM dialog |
-| `deployment.yaml` | `DB_HOST` | CloudNative-PG cluster read-write service name |
-| `ingress.yaml` | host + TLS annotations | Adjust to your ingress controller and cert-manager setup |
-
-### Updating the scripts
-
-The Python scripts live in `k8s/` and are embedded into a ConfigMap automatically by Kustomize on each ArgoCD sync. No manual generation step required — just edit, commit, and push:
-
-```bash
-git add k8s/news_feed_cyberpunk.py   # or k8s/api_server.py
-git commit -m "..."
-git push
-```
-
-ArgoCD runs `kustomize build` server-side. Because the ConfigMap name includes a content hash, any change to the Python files triggers an automatic pod rollout.
+`ghcr.io/movray/feed-reader-llm:edge` is built from every commit on `main` (signed, not
+released).
 
 ### Environment variables
 
+The chart sets these; they matter when running the image yourself.
+
 | Variable | Description |
 |---|---|
-| `DB_HOST` | PostgreSQL host |
-| `DB_NAME` | Database name (`feedconfig`) |
-| `DB_USER` | Database user (from secret) |
-| `DB_PASSWORD` | Database password (from secret) |
-| `DB_PORT` | PostgreSQL port (`5432`) |
-| `LLM_BASE_URL` | OpenAI-compatible LLM base URL |
-| `LLM_MODEL` | Model for LLM requests; init-db writes it to `llm_config.model` once, the generator uses it if the DB is unreachable |
-| `OUTPUT_FILE` | Output path for the shell HTML file (default: `news_zusammenfassung.html`) |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | PostgreSQL connection |
+| `LLM_BASE_URL` | OpenAI-compatible LLM base URL; written to `llm_config.url` on the first start, generator fallback if the DB is unreachable |
+| `LLM_MODEL` | Model for LLM requests; written to `llm_config.model` on the first start, generator fallback if the DB is unreachable |
+| `HTML_DIR` | Shared directory of generator, API and nginx (default `/html`) |
+| `OUTPUT_FILE` | Page shell (default `$HTML_DIR/index.html`) |
+| `GUNICORN_WORKERS`, `GUNICORN_THREADS`, `GUNICORN_TIMEOUT` | API server (defaults 2, 4, 60) |
+| `DB_WAIT_SECONDS` | How long `migrate` waits for the database (default 300) |
 
 ## API endpoints
 
@@ -291,17 +302,8 @@ ArgoCD runs `kustomize build` server-side. Because the ConfigMap name includes a
 | `/api/sync/<uuid>` | POST | Triggers sync for one feed; deletes its block file to force loading state |
 | `/api/sync/status` | GET | Returns current global sync status badge |
 
-## Local development
+## Development
 
-```bash
-pip install feedparser requests psycopg2-binary flask
-
-# Run the generator once (requires DB env vars + reachable LLM)
-python k8s/news_feed_cyberpunk.py
-
-# Process a single feed by source ID
-python k8s/news_feed_cyberpunk.py --feed <id>
-
-# Run the API server
-python k8s/api_server.py
-```
+See [DEVELOPER.md](DEVELOPER.md). In short: `make up` starts the stack with docker compose,
+`make scan` builds the image and runs the same Trivy check as the release, `make lint` checks
+the chart.

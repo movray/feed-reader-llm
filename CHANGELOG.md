@@ -6,6 +6,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.16.0] — 2026-11-08
+
+### Added
+- **Docker image** `ghcr.io/movray/feed-reader-llm` (linux/amd64, linux/arm64) with generator, API and schema migration; the first argument picks the role. Based on `python:3.13-alpine`, non-root, no pip in the image, dependencies pinned with hashes
+- **Helm chart** `oci://ghcr.io/movray/charts/feed-reader-llm`: external PostgreSQL (`database.*`, existing secret or user/password), ingress, optional PVC for the HTML volume, all containers non-root with a read-only root filesystem
+- **Built-in test PostgreSQL** (`postgresql.enabled=true`): single pod with the official `postgres:18-alpine` image, PVC and a generated password that survives upgrades
+- **docker-compose.yml** for a local test without Kubernetes
+- Release workflow: Trivy gate (HIGH/CRITICAL, unfixed included), cosign signatures and build provenance for image and chart, GitHub release from this changelog; `edge` image from every commit on `main`; weekly Trivy scan; Dependabot
+
+### Changed
+- Python sources moved from `k8s/` to `app/`; the schema moved from the init container's psql heredoc to `app/schema.sql`, applied by `app/migrate.py`
+- The API runs under gunicorn instead of the Flask development server
+- One-time data migrations moved from the API start into `schema.sql` (no race between gunicorn workers)
+- nginx runs as `nginxinc/nginx-unprivileged` on port 8080 with a `/healthz` endpoint
+- Sync trigger files are placed next to `OUTPUT_FILE` instead of a fixed `/html`
+
+### Removed
+- `k8s/` (Kustomize manifests); deploy with the Helm chart. Existing databases are taken over unchanged: the schema statements are idempotent and the recorded migrations do not run again
+
+---
+
 ## [1.15.1] — 2026-10-15
 
 ### Fixed
